@@ -1,0 +1,14 @@
+{
+  "indices": [
+    {
+      "code": "h00300",
+      "name": "沪深300全收益",
+      "mcp_code": "H00300.CSI",
+      "price_index_code": "000300",
+      "price_index_secid": "1.000300",
+      "data_dir": "data/h00300",
+      "start_date": "20100101",
+      "enabled": true
+    }
+  ]
+}
