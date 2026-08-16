@@ -1,7 +1,7 @@
 {
   "code": "h00300",
   "name": "沪深300全收益",
-  "last_updated": "2026-08-16 08:12:24",
+  "last_updated": "2026-08-16 16:13:23",
   "total_records": 4035,
   "last_date": "2026-08-14",
   "data_source": "akshare/tencent (price) + akshare/legulegu (valuation)"
