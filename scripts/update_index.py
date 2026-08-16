@@ -11,7 +11,7 @@
 数据来源:
   - K线行情 (收盘价/成交量/成交额): push2his.eastmoney.com
   - 指数估值 (PE/PB): datacenter-web.eastmoney.com
-  - 实时行情兜底: push2.eastmoney.com
+  - 实时行情兜底: push2his.eastmoney.com (最新日K线)
 
 用法:
     uv run scripts/update_index.py                # 增量更新所有启用指数
@@ -22,6 +22,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 import sys
 import time
@@ -34,7 +35,6 @@ import requests
 API_KLINE = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 API_DATACENTER = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 API_SEARCH = "https://searchapi.eastmoney.com/api/suggest/get"
-API_QUOTE = "https://push2.eastmoney.com/api/qt/stock/get"
 
 HEADERS = {
     "User-Agent": (
@@ -45,8 +45,8 @@ HEADERS = {
     "Referer": "https://quote.eastmoney.com/",
 }
 
-# K线字段映射: f51=日期, f52=开盘, f53=收盘, f54=最高, f55=最低,
-#              f56=成交量(手), f57=成交额(元), f58=振幅
+# K线字段: f51=日期, f52=开盘, f53=收盘, f54=最高, f55=最低,
+#          f56=成交量(手), f57=成交额(元), f58=振幅
 KLINE_FIELDS = "f51,f52,f53,f54,f55,f56,f57,f58"
 
 # 项目根目录 (脚本在 scripts/ 下，根目录是上一级)
@@ -68,17 +68,14 @@ def http_get(url, params, timeout=30, retries=3):
                 print(f"  ⚠ 请求失败 (第{attempt+1}次): {e}, {wait}秒后重试...")
                 time.sleep(wait)
             else:
-                raise
+                print(f"  ⚠ 请求最终失败: {url}")
+                return None
     return None
 
 
 # ── secid 查找 ─────────────────────────────────────────────────
 def find_secid(code):
-    """
-    通过东方财富搜索 API 查找指数的 secid。
-    返回格式如 "1.000300" (上海) 或 "0.399001" (深圳)。
-    """
-    # 常见指数的预设 secid
+    """通过东方财富搜索 API 查找指数的 secid。"""
     preset = {
         "000300": "1.000300",
         "000905": "1.000905",
@@ -89,49 +86,32 @@ def find_secid(code):
     }
     if code in preset:
         return preset[code]
-
-    # 搜索 API 查找
     try:
         data = http_get(API_SEARCH, {
-            "input": code,
-            "type": "14",
-            "token": "D43BF722C8E33BDC906FB84D85E326E8",
-            "count": 5,
+            "input": code, "type": "14",
+            "token": "D43BF722C8E33BDC906FB84D85E326E8", "count": 5,
         })
         if data and data.get("QuotationCodeTable"):
             for item in data["QuotationCodeTable"]:
                 if item.get("Code") == code.upper():
-                    market = item.get("MktNum", "1")
-                    return f"{market}.{code}"
+                    return f"{item.get('MktNum', '1')}.{code}"
     except Exception:
         pass
-
-    # 默认尝试上海市场
     return f"1.{code}"
 
 
 # ── K线数据获取 ────────────────────────────────────────────────
 def fetch_kline(secid, beg_date, end_date, klt=101):
-    """
-    从 push2his API 获取 K 线数据。
-
-    参数:
-        secid: 证券ID，如 "1.000300"
-        beg_date: 开始日期 YYYYMMDD
-        end_date: 结束日期 YYYYMMDD
-        klt: K线类型 (101=日线, 102=周线, 103=月线)
-
-    返回: list[dict]，每个 dict 包含 date, close, volume, amount
-    """
+    """从 push2his API 获取 K 线数据。"""
     params = {
         "secid": secid,
         "fields1": "f1,f2,f3,f4,f5,f6",
         "fields2": KLINE_FIELDS,
         "klt": str(klt),
-        "fqt": "0",  # 不复权
+        "fqt": "0",
         "beg": beg_date,
         "end": end_date,
-        "lmt": "1000000",  # 足够大，获取全部
+        "lmt": "1000000",
     }
     data = http_get(API_KLINE, params)
     if not data or not data.get("data") or not data["data"].get("klines"):
@@ -145,14 +125,13 @@ def fetch_kline(secid, beg_date, end_date, klt=101):
             continue
         try:
             result.append({
-                "date": parts[0],           # YYYY-MM-DD
-                "close": _safe_float(parts[2]),  # 收盘价
-                "volume": _safe_float(parts[5]), # 成交量(手)
-                "amount": _safe_float(parts[6]), # 成交额(元)
+                "date": parts[0],
+                "close": _safe_float(parts[2]),
+                "volume": _safe_float(parts[5]),
+                "amount": _safe_float(parts[6]),
             })
         except (ValueError, IndexError):
             continue
-
     return result
 
 
@@ -160,40 +139,61 @@ def fetch_kline(secid, beg_date, end_date, klt=101):
 def fetch_valuation(secucode, beg_date, end_date):
     """
     从 datacenter API 获取指数历史估值数据 (PE/PB)。
-
-    尝试多个 reportName，返回第一个成功的。
+    自动分页获取全部数据。
     """
-    # 日期格式转换: YYYYMMDD -> YYYY-MM-DD
     beg = f"{beg_date[:4]}-{beg_date[4:6]}-{beg_date[6:8]}"
     end = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}"
 
-    report_names = [
-        "RPT_INDEX_VALUATIONANALYSIS",
-        "RPT_INDEX_TS",
-        "RPT_INDEX_KZZLSPT",
-        "RPT_INDEX_BASICINFO",
+    # 尝试多个 reportName + filter 组合
+    configs = [
+        # 标准指数估值报告
+        {"reportName": "RPT_INDEX_VALUATIONANALYSIS",
+         "filter": f'(SECUCODE="{secucode}")(TRADE_DATE>=\'{beg}\')(TRADE_DATE<=\'{end}\')'},
+        # 备选: 用 SECURITY_CODE 过滤
+        {"reportName": "RPT_INDEX_VALUATIONANALYSIS",
+         "filter": f'(SECURITY_CODE="{secucode.split(".")[0]}")(TRADE_DATE>=\'{beg}\')(TRADE_DATE<=\'{end}\')'},
+        # 备选报告名
+        {"reportName": "RPT_INDEX_TS",
+         "filter": f'(SECUCODE="{secucode}")(TRADE_DATE>=\'{beg}\')(TRADE_DATE<=\'{end}\')'},
+        # 备选: 指数基本信息服务
+        {"reportName": "RPT_INDEX_BASICINFO",
+         "filter": f'(SECUCODE="{secucode}")'},
     ]
 
-    for rn in report_names:
-        params = {
-            "reportName": rn,
-            "columns": "ALL",
-            "filter": f'(SECUCODE="{secucode}")(TRADE_DATE>=\'{beg}\')(TRADE_DATE<=\'{end}\')',
-            "pageNumber": "1",
-            "pageSize": "500",
-            "sortTypes": "-1",
-            "sortColumns": "TRADE_DATE",
-        }
-        try:
-            data = http_get(API_DATACENTER, params)
-            if data and data.get("result") and data["result"].get("data"):
-                rows = data["result"]["data"]
-                print(f"  ✓ 估值数据获取成功: {rn}, {len(rows)} 条")
-                return _parse_valuation(rows)
-        except Exception:
-            continue
+    for i, cfg in enumerate(configs):
+        all_rows = []
+        page = 1
+        total_pages = 1
 
-    print(f"  ⚠ 估值数据获取失败 (所有 reportName 均未返回数据)")
+        while page <= total_pages:
+            params = {
+                "reportName": cfg["reportName"],
+                "columns": "ALL",
+                "filter": cfg["filter"],
+                "pageNumber": str(page),
+                "pageSize": "500",
+                "sortTypes": "-1",
+                "sortColumns": "TRADE_DATE",
+            }
+            data = http_get(API_DATACENTER, params)
+            if not data or not data.get("result"):
+                break
+
+            result = data["result"]
+            rows = result.get("data", [])
+            if not rows:
+                break
+
+            all_rows.extend(rows)
+            total_count = result.get("totalCount", len(all_rows))
+            total_pages = math.ceil(total_count / 500) if total_count > 0 else 1
+            page += 1
+
+        if all_rows:
+            print(f"  ✓ 估值数据获取成功: {cfg['reportName']} (配置{i+1}), {len(all_rows)} 条")
+            return _parse_valuation(all_rows)
+
+    print(f"  ⚠ 估值数据获取失败 (所有配置均未返回数据)")
     return []
 
 
@@ -205,10 +205,12 @@ def _parse_valuation(rows):
         trade_date = trade_date[:10] if trade_date else ""
 
         pe = (row.get("PE_TTM") or row.get("PE") or
-              row.get("VAL_PE_TTM") or row.get("INDEX_PE"))
-        pb = (row.get("PB") or row.get("VAL_PB") or row.get("INDEX_PB"))
+              row.get("VAL_PE_TTM") or row.get("INDEX_PE") or
+              row.get("PE_TTM2"))
+        pb = (row.get("PB") or row.get("VAL_PB") or row.get("INDEX_PB") or
+              row.get("PB_NEW"))
         dv = (row.get("DV_TTM") or row.get("DIVIDEND_YIELD") or
-              row.get("DV_RATIO"))
+              row.get("DV_RATIO") or row.get("DIVIDEND_YIELD_TTM"))
 
         result.append({
             "date": trade_date,
@@ -219,27 +221,37 @@ def _parse_valuation(rows):
     return result
 
 
-# ── 实时行情兜底 (获取最新PE/PB) ───────────────────────────────
-def fetch_realtime_valuation(secid):
+# ── 实时行情兜底 (用最新日K线获取PE/PB) ────────────────────────
+def fetch_latest_valuation(secid):
     """
-    从 push2 API 获取实时行情中的 PE/PB。
-    用于增量更新时补充最新交易日的估值数据。
+    用 push2his API 获取最近5个交易日的K线，
+    取最新一天的数据作为兜底估值。
     """
-    # f162=PE(动态), f163=PB, f167=最新价, f173=市盈率TTM
+    today = datetime.now().strftime("%Y%m%d")
+    beg = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
+
     params = {
         "secid": secid,
-        "fields": "f57,f58,f162,f163,f167,f173",
-        "fltt": "2",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f161,f162,f163,f173,f184,f185",
+        "klt": "101",
+        "fqt": "0",
+        "beg": beg,
+        "end": today,
+        "lmt": "5",
     }
     try:
-        data = http_get(API_QUOTE, params)
-        if data and data.get("data"):
-            d = data["data"]
-            return {
-                "pe_ttm": _safe_float(d.get("f173") or d.get("f162")),
-                "pb": _safe_float(d.get("f163")),
-                "close": _safe_float(d.get("f167")),
-            }
+        data = http_get(API_KLINE, params)
+        if data and data.get("data") and data["data"].get("klines"):
+            klines = data["data"]["klines"]
+            if klines:
+                parts = klines[-1].split(",")
+                # f162=PE(动态), f163=PB, f173=PE(TTM)
+                # 字段索引: 0=date, ..., 13=f173, 14=f184, 15=f185
+                pe_ttm = _safe_float(parts[13]) if len(parts) > 13 else None  # f173
+                pb = _safe_float(parts[11]) if len(parts) > 11 else None     # f163
+                if pe_ttm or pb:
+                    return {"pe_ttm": pe_ttm, "pb": pb}
     except Exception:
         pass
     return None
@@ -247,13 +259,7 @@ def fetch_realtime_valuation(secid):
 
 # ── 数据合并 ───────────────────────────────────────────────────
 def merge_data(kline_rows, valuation_rows, realtime=None):
-    """
-    合并 K线数据和估值数据。
-    K线提供 date, close, volume, amount
-    估值提供 date, pe_ttm, pb, dividend_yield
-    按 date 合并，K线数据为主表。
-    """
-    # 构建估值查找表
+    """合并 K线数据和估值数据，按 date 合并。"""
     val_map = {}
     for v in valuation_rows:
         if v["date"]:
@@ -293,7 +299,6 @@ CSV_COLUMNS = ["date", "close", "volume", "amount", "pe_ttm", "pb", "dividend_yi
 
 
 def get_last_date(csv_path):
-    """读取 CSV 中最后一条记录的日期。"""
     if not csv_path.exists():
         return None
     last_date = None
@@ -307,7 +312,6 @@ def get_last_date(csv_path):
 
 
 def read_existing_dates(csv_path):
-    """读取 CSV 中所有已有的日期集合。"""
     dates = set()
     if not csv_path.exists():
         return dates
@@ -321,7 +325,6 @@ def read_existing_dates(csv_path):
 
 
 def write_csv(csv_path, rows):
-    """全量写入 CSV（用于初始化）。"""
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
@@ -331,15 +334,11 @@ def write_csv(csv_path, rows):
 
 
 def append_csv(csv_path, new_rows):
-    """增量追加 CSV（跳过已有日期）。"""
     existing = read_existing_dates(csv_path)
     truly_new = [r for r in new_rows if r["date"] not in existing]
-
     if not truly_new:
         print(f"  ✓ 无新数据需要追加")
         return 0
-
-    # 追加模式
     file_exists = csv_path.exists()
     with open(csv_path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
@@ -347,30 +346,21 @@ def append_csv(csv_path, new_rows):
             writer.writeheader()
             csv_path.parent.mkdir(parents=True, exist_ok=True)
         writer.writerows(truly_new)
-
     print(f"  ✓ 追加 {len(truly_new)} 条新记录到 {csv_path.name}")
     return len(truly_new)
 
 
 # ── 单指数更新 ─────────────────────────────────────────────────
 def update_index(cfg, force_full=False):
-    """
-    更新单个指数的数据。
-
-    流程:
-    1. 读取配置 (code, secid, start_date 等)
-    2. 检查已有 CSV 的最后日期
-    3. 确定获取范围 (全量 or 增量)
-    4. 调用 API 获取数据
-    5. 合并并写入 CSV
-    """
     code = cfg["code"]
     name = cfg.get("name", code)
     data_dir = ROOT / cfg.get("data_dir", f"data/{code}")
     csv_path = data_dir / "daily.csv"
     start_date = cfg.get("start_date", "20100101")
     price_secid = cfg.get("price_index_secid", find_secid(cfg.get("price_index_code", code)))
-    secucode = cfg.get("mcp_code", cfg.get("price_index_code", code))
+    # 估值查询用的 secucode: 优先用 valuation_secucode，其次用 price_index_code.SH
+    valuation_secucode = cfg.get("valuation_secucode",
+                                  f"{cfg.get('price_index_code', code)}.SH")
 
     today = datetime.now().strftime("%Y%m%d")
     today_fmt = datetime.now().strftime("%Y-%m-%d")
@@ -378,19 +368,17 @@ def update_index(cfg, force_full=False):
     print(f"\n{'='*60}")
     print(f"更新指数: {name} ({code})")
     print(f"  secid: {price_secid}")
-    print(f"  secucode: {secucode}")
+    print(f"  valuation_secucode: {valuation_secucode}")
     print(f"  数据目录: {data_dir}")
 
     # 确定获取范围
     last_date = get_last_date(csv_path) if not force_full else None
 
     if last_date:
-        # 增量更新: 从最后日期的次日开始
         last_dt = datetime.strptime(last_date, "%Y-%m-%d")
         beg = (last_dt + timedelta(days=1)).strftime("%Y%m%d")
         print(f"  模式: 增量更新 ({last_date} -> {today_fmt})")
     else:
-        # 全量初始化
         beg = start_date
         print(f"  模式: 全量初始化 ({start_date[:4]}-{start_date[4:6]}-{start_date[6:8]} -> {today_fmt})")
 
@@ -402,22 +390,27 @@ def update_index(cfg, force_full=False):
         return False
     print(f"  ✓ K线数据: {len(kline_rows)} 条")
 
-    # 2. 获取估值数据 (PE/PB)
-    print(f"  获取估值数据: {secucode}, {beg}~{today}")
-    val_rows = fetch_valuation(secucode, beg, today)
+    # 2. 获取估值数据 (PE/PB) - 使用 valuation_secucode
+    print(f"  获取估值数据: {valuation_secucode}, {beg}~{today}")
+    val_rows = fetch_valuation(valuation_secucode, beg, today)
 
     # 3. 获取实时估值兜底
     realtime = None
     if kline_rows:
-        realtime = fetch_realtime_valuation(price_secid)
+        realtime = fetch_latest_valuation(price_secid)
         if realtime:
-            print(f"  ✓ 实时估值: PE={realtime.get('pe_ttm')}, PB={realtime.get('pb')}")
+            print(f"  ✓ 最新估值兜底: PE={realtime.get('pe_ttm')}, PB={realtime.get('pb')}")
 
     # 4. 合并数据
     merged = merge_data(kline_rows, val_rows, realtime)
     if not merged:
         print(f"  ✗ 合并后无数据，跳过")
         return False
+
+    # 统计估值覆盖率
+    pe_count = sum(1 for r in merged if r["pe_ttm"])
+    pb_count = sum(1 for r in merged if r["pb"])
+    print(f"  估值覆盖: PE={pe_count}/{len(merged)}, PB={pb_count}/{len(merged)}")
 
     # 5. 写入 CSV
     if force_full or not csv_path.exists():
@@ -444,7 +437,6 @@ def update_index(cfg, force_full=False):
 
 # ── 工具函数 ───────────────────────────────────────────────────
 def _safe_float(val):
-    """安全转换为 float，失败返回 None。"""
     if val is None or val == "" or val == "-":
         return None
     try:
@@ -456,11 +448,10 @@ def _safe_float(val):
 # ── 主函数 ─────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="指数数据更新工具")
-    parser.add_argument("--full", action="store_true", help="全量重新获取 (忽略已有数据)")
-    parser.add_argument("--index", type=str, help="只更新指定指数代码 (如 h00300)")
+    parser.add_argument("--full", action="store_true", help="全量重新获取")
+    parser.add_argument("--index", type=str, help="只更新指定指数代码")
     args = parser.parse_args()
 
-    # 读取配置
     if not CONFIG_PATH.exists():
         print(f"✗ 配置文件不存在: {CONFIG_PATH}")
         sys.exit(1)

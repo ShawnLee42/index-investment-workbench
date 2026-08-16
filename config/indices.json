@@ -6,6 +6,7 @@
       "mcp_code": "H00300.CSI",
       "price_index_code": "000300",
       "price_index_secid": "1.000300",
+      "valuation_secucode": "000300.SH",
       "data_dir": "data/h00300",
       "start_date": "20100101",
       "enabled": true
