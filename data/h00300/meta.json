@@ -1,8 +1,8 @@
 {
   "code": "h00300",
   "name": "沪深300全收益",
-  "last_updated": "2026-08-16 15:16:45",
-  "total_records": 4035,
-  "last_date": "2026-08-14",
+  "last_updated": "2026-08-16 15:25:17",
+  "total_records": 1700,
+  "last_date": "2017-12-29",
   "data_source": "eastmoney"
 }
