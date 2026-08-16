@@ -386,6 +386,9 @@ def update_index(cfg, force_full=False):
     print(f"  获取K线数据: {price_secid}, {beg}~{today}")
     kline_rows = fetch_kline(price_secid, beg, today)
     if not kline_rows:
+        if last_date:
+            print(f"  ✓ 无新交易数据 (上次更新: {last_date})")
+            return True  # 增量更新无新数据不算失败
         print(f"  ✗ K线数据获取失败，跳过")
         return False
     print(f"  ✓ K线数据: {len(kline_rows)} 条")

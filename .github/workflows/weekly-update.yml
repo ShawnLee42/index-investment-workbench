@@ -4,7 +4,16 @@ on:
   schedule:
     # UTC 周六 08:00 = 北京时间周六 16:00
     - cron: '0 8 * * 6'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      full:
+        description: '全量重新获取 (忽略已有数据)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 permissions:
   contents: write
@@ -21,7 +30,12 @@ jobs:
           version: "latest"
 
       - name: Run update script
-        run: uv run scripts/update_index.py
+        run: |
+          if [ "${{ github.event.inputs.full }}" = "true" ]; then
+            uv run scripts/update_index.py --full
+          else
+            uv run scripts/update_index.py
+          fi
         env:
           TZ: Asia/Shanghai
 
