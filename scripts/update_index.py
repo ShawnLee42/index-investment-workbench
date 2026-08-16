@@ -1,12 +1,13 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["requests"]
+# dependencies = ["akshare"]
 # ///
 """
 指数投资工作台 - 数据更新脚本
 
-直接调用东方财富公开 HTTP API，不依赖 MCP/Skill。
-所有数据（收盘价/成交量/成交额/PE/PB）均从 push2his K线API 获取。
+数据源 (全部通过 AKShare):
+  - 量价数据 (收盘价/成交量): stock_zh_index_daily_tx → 腾讯财经
+  - 估值数据 (PE/PB/中位数): stock_index_pe_lg / stock_index_pb_lg → Legulegu (理杏仁)
 
 用法:
     uv run scripts/update_index.py                # 增量更新所有启用指数
@@ -17,173 +18,81 @@
 import argparse
 import csv
 import json
-import math
-import os
 import sys
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
-
-import requests
-
-# ── 东方财富 API 端点 ──────────────────────────────────────────
-API_KLINE = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-API_SEARCH = "https://searchapi.eastmoney.com/api/suggest/get"
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://quote.eastmoney.com/",
-}
-
-# K线字段: f51=日期, f52=开盘, f53=收盘, f54=最高, f55=最低,
-#          f56=成交量(手), f57=成交额(元), f58=振幅,
-#          f59=涨跌幅, f60=涨跌额, f161=换手率,
-#          f162=PE(动态), f163=PB, f173=PE(TTM)
-KLINE_FIELDS = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f161,f162,f163,f173"
-
-# 字段索引映射 (对应 KLINE_FIELDS 中的顺序)
-# 0=date, 1=open, 2=close, 3=high, 4=low, 5=volume, 6=amount,
-# 7=amplitude, 8=change_pct, 9=change_amt, 10=turnover,
-# 11=pe_dynamic, 12=pb, 13=pe_ttm
-IDX_DATE = 0
-IDX_CLOSE = 2
-IDX_VOLUME = 5
-IDX_AMOUNT = 6
-IDX_PE_DYNAMIC = 11
-IDX_PB = 12
-IDX_PE_TTM = 13
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "config" / "indices.json"
 
-
-# ── HTTP 请求封装 ──────────────────────────────────────────────
-def http_get(url, params, timeout=30, retries=5):
-    """带重试的 GET 请求。"""
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            if attempt < retries - 1:
-                wait = 3 * (2 ** attempt)  # 3, 6, 12, 24 秒
-                print(f"\n  ⚠ 请求失败 (第{attempt+1}次): {e}, {wait}秒后重试...", end="", flush=True)
-                time.sleep(wait)
-            else:
-                print(f"\n  ⚠ 请求最终失败: {url}")
-                return None
-    return None
+CSV_COLUMNS = [
+    "date", "close", "volume", "amount",
+    "pe_ttm", "pe_median", "pb", "pb_median",
+    "dividend_yield",
+]
 
 
-# ── secid 查找 ─────────────────────────────────────────────────
-def find_secid(code):
-    preset = {
-        "000300": "1.000300",
-        "000905": "1.000905",
-        "000016": "1.000016",
-        "000852": "1.000852",
-        "399006": "0.399006",
-        "399300": "0.399300",
-    }
-    if code in preset:
-        return preset[code]
-    try:
-        data = http_get(API_SEARCH, {
-            "input": code, "type": "14",
-            "token": "D43BF722C8E33BDC906FB84D85E326E8", "count": 5,
+# ── AKShare 数据获取 ───────────────────────────────────────────
+def fetch_price_akshare(tx_symbol):
+    """从 AKShare (腾讯财经) 获取指数量价数据。
+
+    返回: [{date, close, volume}] 列表，按日期升序
+    """
+    import akshare as ak
+
+    df = ak.stock_zh_index_daily_tx(symbol=tx_symbol)
+    print(f"    腾讯量价: {len(df)} 条", flush=True)
+
+    rows = []
+    for _, row in df.iterrows():
+        date_str = str(row["date"])[:10]  # YYYY-MM-DD
+        rows.append({
+            "date": date_str,
+            "close": _safe_float(row.get("close")),
+            "volume": _safe_float(row.get("amount")),  # 腾讯接口 amount 实为成交量(手)
         })
-        if data and data.get("QuotationCodeTable"):
-            for item in data["QuotationCodeTable"]:
-                if item.get("Code") == code.upper():
-                    return f"{item.get('MktNum', '1')}.{code}"
-    except Exception:
-        pass
-    return f"1.{code}"
+    return rows
 
 
-# ── K线数据获取 (含PE/PB) ─────────────────────────────────────
-def fetch_kline(secid, beg_date, end_date, klt=101):
-    """从 push2his API 获取 K 线数据 (含 PE/PB)，按年分批。"""
-    beg_year = int(beg_date[:4])
-    end_year = int(end_date[:4])
-    if end_year - beg_year > 1:
-        return _fetch_kline_chunked(secid, beg_date, end_date, klt)
-    return _fetch_kline_single(secid, beg_date, end_date, klt)
+def fetch_valuation_akshare(lg_symbol):
+    """从 AKShare (Legulegu 理杏仁) 获取指数 PE/PB 估值数据。
 
+    返回: {date_str: {pe_ttm, pe_median, pb, pb_median}} 字典
+    """
+    import akshare as ak
 
-def _fetch_kline_single(secid, beg_date, end_date, klt=101):
-    """单次 K 线请求。"""
-    params = {
-        "secid": secid,
-        "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2": KLINE_FIELDS,
-        "klt": str(klt),
-        "fqt": "0",
-        "beg": beg_date,
-        "end": end_date,
-        "lmt": "1000000",
-    }
-    data = http_get(API_KLINE, params)
-    if not data or not data.get("data") or not data["data"].get("klines"):
-        return []
-    return _parse_klines(data["data"]["klines"])
+    valuation = {}
 
-
-def _fetch_kline_chunked(secid, beg_date, end_date, klt=101):
-    """按年分批获取 K 线数据。"""
-    beg_year = int(beg_date[:4])
-    end_year = int(end_date[:4])
-    all_rows = []
-
-    for year in range(beg_year, end_year + 1):
-        y_beg = beg_date if year == beg_year else f"{year}0101"
-        y_end = end_date if year == end_year else f"{year}1231"
-
-        print(f"    {year}...", end=" ", flush=True)
-        rows = _fetch_kline_single(secid, y_beg, y_end, klt)
-        print(f"{len(rows)} 条", flush=True)
-        all_rows.extend(rows)
-        time.sleep(2)  # 2秒间隔，避免限流
-
-    if not all_rows:
-        print(f"  ⚠ K线数据为空: secid={secid}, {beg_date}~{end_date}")
-    return all_rows
-
-
-def _parse_klines(klines):
-    """解析 K线数据行，提取 close/volume/amount/pe_ttm/pb。"""
-    result = []
-    for line in klines:
-        parts = line.split(",")
-        if len(parts) <= IDX_CLOSE:
-            continue
-        try:
-            row = {
-                "date": parts[IDX_DATE],
-                "close": _safe_float(parts[IDX_CLOSE]),
-                "volume": _safe_float(parts[IDX_VOLUME]) if len(parts) > IDX_VOLUME else None,
-                "amount": _safe_float(parts[IDX_AMOUNT]) if len(parts) > IDX_AMOUNT else None,
-                "pe_ttm": _safe_float(parts[IDX_PE_TTM]) if len(parts) > IDX_PE_TTM else None,
-                "pb": _safe_float(parts[IDX_PB]) if len(parts) > IDX_PB else None,
+    # ── PE 数据 ──
+    try:
+        pe_df = ak.stock_index_pe_lg(symbol=lg_symbol)
+        print(f"    Legulegu PE: {len(pe_df)} 条", flush=True)
+        for _, row in pe_df.iterrows():
+            date_str = str(row["日期"])[:10]
+            valuation[date_str] = {
+                "pe_ttm": _safe_float(row.get("滚动市盈率")),
+                "pe_median": _safe_float(row.get("滚动市盈率中位数")),
             }
-            # 如果 TTM PE 为空，用动态 PE 兜底
-            if not row["pe_ttm"] and len(parts) > IDX_PE_DYNAMIC:
-                row["pe_ttm"] = _safe_float(parts[IDX_PE_DYNAMIC])
-            result.append(row)
-        except (ValueError, IndexError):
-            continue
-    return result
+    except Exception as e:
+        print(f"  ⚠ AKShare PE 获取失败: {e}")
+
+    # ── PB 数据 ──
+    try:
+        pb_df = ak.stock_index_pb_lg(symbol=lg_symbol)
+        print(f"    Legulegu PB: {len(pb_df)} 条", flush=True)
+        for _, row in pb_df.iterrows():
+            date_str = str(row["日期"])[:10]
+            if date_str not in valuation:
+                valuation[date_str] = {}
+            valuation[date_str]["pb"] = _safe_float(row.get("市净率"))
+            valuation[date_str]["pb_median"] = _safe_float(row.get("市净率中位数"))
+    except Exception as e:
+        print(f"  ⚠ AKShare PB 获取失败: {e}")
+
+    return valuation
 
 
 # ── CSV 读写 ───────────────────────────────────────────────────
-CSV_COLUMNS = ["date", "close", "volume", "amount", "pe_ttm", "pb", "dividend_yield"]
-
-
 def get_last_date(csv_path):
     if not csv_path.exists():
         return None
@@ -243,69 +152,96 @@ def update_index(cfg, force_full=False):
     data_dir = ROOT / cfg.get("data_dir", f"data/{code}")
     csv_path = data_dir / "daily.csv"
     start_date = cfg.get("start_date", "20100101")
-    price_secid = cfg.get("price_index_secid", find_secid(cfg.get("price_index_code", code)))
+    tx_symbol = cfg.get("tx_symbol", f"sh{cfg.get('price_index_code', '000300')}")
+    lg_symbol = cfg.get("akshare_symbol", "")
 
-    today = datetime.now().strftime("%Y%m%d")
     today_fmt = datetime.now().strftime("%Y-%m-%d")
 
     print(f"\n{'='*60}")
     print(f"更新指数: {name} ({code})")
-    print(f"  secid: {price_secid}")
+    print(f"  量价源: AKShare/腾讯 ({tx_symbol})")
+    print(f"  估值源: AKShare/Legulegu ({lg_symbol or '未配置'})")
     print(f"  数据目录: {data_dir}")
 
     last_date = get_last_date(csv_path) if not force_full else None
 
     if last_date:
-        last_dt = datetime.strptime(last_date, "%Y-%m-%d")
-        beg = (last_dt + timedelta(days=1)).strftime("%Y%m%d")
-        print(f"  模式: 增量更新 ({last_date} -> {today_fmt})")
+        print(f"  模式: 增量更新 (上次: {last_date} -> {today_fmt})")
     else:
-        beg = start_date
         print(f"  模式: 全量初始化 ({start_date[:4]}-{start_date[4:6]}-{start_date[6:8]} -> {today_fmt})")
 
-    # 获取 K线数据 (含 PE/PB)
-    print(f"  获取K线数据: {price_secid}, {beg}~{today}")
-    kline_rows = fetch_kline(price_secid, beg, today)
-    if not kline_rows:
-        if last_date:
-            print(f"  ✓ 无新交易数据 (上次更新: {last_date})")
-            return True
-        print(f"  ✗ K线数据获取失败")
+    # ── 1. 获取量价数据 (AKShare/腾讯) ──
+    print(f"  [1/2] 获取量价数据...")
+    price_rows = fetch_price_akshare(tx_symbol)
+    if not price_rows:
+        print(f"  ✗ 量价数据获取失败")
         return False
-    print(f"  ✓ K线数据: {len(kline_rows)} 条")
+    print(f"  ✓ 量价数据: {len(price_rows)} 条 ({price_rows[0]['date']} ~ {price_rows[-1]['date']})")
 
-    # 转换为 CSV 行格式
+    # ── 2. 获取估值数据 (AKShare/Legulegu) ──
+    valuation_map = {}
+    if lg_symbol:
+        print(f"  [2/2] 获取估值数据...")
+        valuation_map = fetch_valuation_akshare(lg_symbol)
+        print(f"  ✓ 估值数据: {len(valuation_map)} 条")
+    else:
+        print(f"  [2/2] 跳过估值数据 (未配置 akshare_symbol)")
+
+    # ── 3. 合并量价 + 估值，按 start_date 过滤 ──
+    start_str = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}" if len(start_date) == 8 else start_date
+
     merged = []
-    for k in kline_rows:
+    pe_count = 0
+    pb_count = 0
+    for p in price_rows:
+        if p["date"] < start_str:
+            continue
+
+        val = valuation_map.get(p["date"], {})
+        pe_ttm = val.get("pe_ttm", "")
+        pe_median = val.get("pe_median", "")
+        pb = val.get("pb", "")
+        pb_median = val.get("pb_median", "")
+
+        if pe_ttm:
+            pe_count += 1
+        if pb:
+            pb_count += 1
+
         merged.append({
-            "date": k["date"],
-            "close": k["close"] or "",
-            "volume": k["volume"] or "",
-            "amount": k["amount"] or "",
-            "pe_ttm": k["pe_ttm"] or "",
-            "pb": k["pb"] or "",
+            "date": p["date"],
+            "close": p["close"] or "",
+            "volume": p["volume"] or "",
+            "amount": "",
+            "pe_ttm": pe_ttm or "",
+            "pe_median": pe_median or "",
+            "pb": pb or "",
+            "pb_median": pb_median or "",
             "dividend_yield": "",
         })
 
-    # 统计估值覆盖率
-    pe_count = sum(1 for r in merged if r["pe_ttm"])
-    pb_count = sum(1 for r in merged if r["pb"])
-    print(f"  估值覆盖: PE={pe_count}/{len(merged)}, PB={pb_count}/{len(merged)}")
+    total = len(merged)
+    if total == 0:
+        print(f"  ✗ 合并后无数据 (start_date={start_str})")
+        return False
 
-    # 写入 CSV
+    print(f"  估值覆盖: PE={pe_count}/{total} ({pe_count*100//total}%), "
+          f"PB={pb_count}/{total} ({pb_count*100//total}%)")
+
+    # ── 4. 写入 CSV ──
     if force_full or not csv_path.exists():
         write_csv(csv_path, merged)
     else:
         append_csv(csv_path, merged)
 
-    # 更新 meta.json
+    # ── 5. 更新 meta.json ──
     meta = {
         "code": code,
         "name": name,
         "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "total_records": len(read_existing_dates(csv_path)),
         "last_date": get_last_date(csv_path),
-        "data_source": "eastmoney",
+        "data_source": "akshare/tencent (price) + akshare/legulegu (valuation)",
     }
     meta_path = data_dir / "meta.json"
     with open(meta_path, "w") as f:
@@ -319,7 +255,10 @@ def _safe_float(val):
     if val is None or val == "" or val == "-":
         return None
     try:
-        return float(val)
+        result = float(val)
+        if result != result:  # NaN check
+            return None
+        return result
     except (ValueError, TypeError):
         return None
 
