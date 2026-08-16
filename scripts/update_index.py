@@ -102,7 +102,18 @@ def find_secid(code):
 
 # ── K线数据获取 ────────────────────────────────────────────────
 def fetch_kline(secid, beg_date, end_date, klt=101):
-    """从 push2his API 获取 K 线数据。"""
+    """从 push2his API 获取 K 线数据，按年分批避免单次请求过大。"""
+    # 如果跨度超过2年，按年分批获取
+    beg_year = int(beg_date[:4])
+    end_year = int(end_date[:4])
+    if end_year - beg_year > 1:
+        return _fetch_kline_chunked(secid, beg_date, end_date, klt)
+
+    return _fetch_kline_single(secid, beg_date, end_date, klt)
+
+
+def _fetch_kline_single(secid, beg_date, end_date, klt=101):
+    """单次 K 线请求。"""
     params = {
         "secid": secid,
         "fields1": "f1,f2,f3,f4,f5,f6",
@@ -115,7 +126,6 @@ def fetch_kline(secid, beg_date, end_date, klt=101):
     }
     data = http_get(API_KLINE, params)
     if not data or not data.get("data") or not data["data"].get("klines"):
-        print(f"  ⚠ K线数据为空: secid={secid}, {beg_date}~{end_date}")
         return []
 
     result = []
@@ -133,6 +143,31 @@ def fetch_kline(secid, beg_date, end_date, klt=101):
         except (ValueError, IndexError):
             continue
     return result
+
+
+def _fetch_kline_chunked(secid, beg_date, end_date, klt=101):
+    """按年分批获取 K 线数据，避免单次请求过大被限流。"""
+    beg_year = int(beg_date[:4])
+    end_year = int(end_date[:4])
+    all_rows = []
+
+    for year in range(beg_year, end_year + 1):
+        y_beg = f"{year}0101"
+        y_end = f"{year}1231"
+        if year == beg_year:
+            y_beg = beg_date
+        if year == end_year:
+            y_end = end_date
+
+        print(f"    获取 {year} 年数据...", end="", flush=True)
+        rows = _fetch_kline_single(secid, y_beg, y_end, klt)
+        print(f" {len(rows)} 条")
+        all_rows.extend(rows)
+        time.sleep(0.5)  # 年间隔，避免限流
+
+    if not all_rows:
+        print(f"  ⚠ K线数据为空: secid={secid}, {beg_date}~{end_date}")
+    return all_rows
 
 
 # ── 指数估值数据获取 (PE/PB) ───────────────────────────────────
